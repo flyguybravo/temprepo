@@ -1,0 +1,254 @@
+# Variable 'ImageName' was defined in the Variables tab
+# Variable 'ImageRepo' was defined in the Variables tab
+# Variable 'PointOfEntry' was defined in the Variables tab
+# Variable 'RuntimeImage' was defined in the Variables tab
+# Variable 'SecureToken' was defined in the Variables tab
+trigger:
+  paths:
+    include:
+    - $/Company Services/ServiceA/Main
+  batch: True
+name: $(date:yyyyMMdd)$(rev:.r)
+resources:
+  repositories:
+  - repository: self
+    type: git
+    ref: $/Company Services/ServiceA/Main
+jobs:
+- job: Job_1
+  displayName: Containerize Vehicle Information Service
+  pool:
+    name: EKS-Linux
+  steps:
+  - checkout: self
+  - task: PowerShell@2
+    displayName: Log Environment Variables
+    inputs:
+      targetType: inline
+      script: 'Get-ChildItem env:'
+  - task: Bash@3
+    displayName: Clean Artifact Directory
+    inputs:
+      targetType: inline
+      script: >
+        rm -rfv $BUILD_ARTIFACTSTAGINGDIRECTORY/*
+  - task: DotNetCoreCLI@2
+    displayName: dotnet restore
+    inputs:
+      command: restore
+      projects: '**/Company.ServiceA.sln'
+      feedRestore: 57e4f1f8-2f3b-4919-85f1-15cd9765b4b0
+  - task: PowerShell@2
+    displayName: List Solution Packages
+    inputs:
+      targetType: inline
+      script: >
+        dotnet list "./Company.ServiceA.sln" package
+  - task: DotNetCoreCLI@2
+    displayName: dotnet build
+    inputs:
+      projects: '**/Company.ServiceA.sln'
+      arguments: -p:platform="$(BuildPlatform)" -c "$(BuildConfiguration)" --no-restore
+  - task: DotNetCoreCLI@2
+    displayName: dotnet publish
+    inputs:
+      command: publish
+      publishWebProjects: false
+      projects: ./Company.ServiceA.Api/Company.ServiceA.Api.csproj
+      arguments: -c "$(BuildConfiguration)" -o "$(Build.ArtifactStagingDirectory)/publish" --no-build
+      zipAfterPublish: false
+      modifyOutputPath: false
+  - task: Bash@3
+    displayName: Generate ApiVersion JSON File
+    inputs:
+      targetType: inline
+      script: >-
+        echo "::: Generate ApiVersion JSON :::"
+
+        azTarget="ServiceA"
+
+        projectFolder="Main"
+
+        azProj="$SYSTEM_TEAMPROJECT"
+
+        timeStamp=$(date +"%Y%m%d-%H%M%S")
+
+        newGuid=$(cat /proc/sys/kernel/random/uuid)
+
+        baseUrl="https://dev.azure.com/Company/$azProj/_apis/tfvc/changesets?\$top=1&maxCommentLength=2000&searchCriteria.itemPath="
+
+        fullUrl="$baseUrl/$azTarget/$projectFolder&api-version=6.0"
+
+        encUrl="${fullUrl// /%20}"
+
+        apiCreds="me@Company.com:$azToken"
+
+        apiResult=$(curl -u "$apiCreds" "$encUrl")
+
+        latestChangeset=$(echo "$apiResult" | jq .value[0].changesetId -r)
+
+        if [ -z "$latestChangeset" ]; then
+            echo -e "   >>> Latest changeset not detected. Possible error, exiting."
+            exit 1
+        fi
+
+        latestComment=$(echo "$apiResult" | jq .value[0].comment -r)
+
+        if [ -z "$latestComment" ]; then
+            echo -e "   >>> Latest comment not detected. Possible error, exiting."
+            exit 1
+        fi
+
+        pattern="\{(.*?)\}"
+
+        if [[ $latestComment =~ $pattern ]]; then
+            latestComment=$(echo "$BASH_REMATCH")
+        fi
+
+        apiVersion=$(jq -n --arg version "$newGuid" --arg branch "$latestComment" --arg build "$latestChangeset" --arg timestamp "$timeStamp" '{AppSettings:{ApiVersion:$version,BranchName:$branch,BuildNumber:$build,BuildTimestamp:$timestamp}}')
+
+        echo -e "\n   >>> JSON constructed ..."
+
+        echo -e "\n$apiVersion" | jq '.'
+
+        apiVersionOutput="${BUILD_ARTIFACTSTAGINGDIRECTORY}/publish/appsettings.ApiVersion.json"
+
+        echo "$apiVersion" | jq '.' > $apiVersionOutput
+
+        echo -e "\n   >>> JSON saved."
+
+        echo "::: Complete :::"
+  - task: Bash@3
+    displayName: Generate Dockerfile
+    inputs:
+      targetType: inline
+      script: >-
+        echo "::: Begin Dockerfile Generation :::"
+
+        # Build the Dockerfile
+
+
+        read -r -d '' DOCKERFILEGEN << EOF
+
+        FROM $RUNTIMEIMAGE
+
+
+        WORKDIR /app
+
+
+        COPY publish/ ./
+
+
+        EXPOSE 80
+
+
+        ENV DOTNET_USE_POLLING_FILE_WATCHER=1
+
+        ENV AWS_DEFAULT_REGION=us-east-2
+
+        ENV AWS_REGION=us-east-2
+
+
+        ENTRYPOINT ["dotnet", "$POINTOFENTRY"]
+
+        EOF
+
+
+        oPath="$BUILD_ARTIFACTSTAGINGDIRECTORY/Dockerfile"
+
+        echo "   >>> Saving Dockerfile: $oPath"
+
+        echo "$DOCKERFILEGEN" > "$oPath"
+
+
+        echo "::: Dockerfile Generation Complete :::"
+  - task: Bash@3
+    displayName: Docker Build
+    inputs:
+      targetType: inline
+      script: >
+        fullImage="$IMAGEREPO/$IMAGENAME"
+
+        region='us-east-2'
+
+
+        echo "Image to build: $fullImage:$BUILD_BUILDNUMBER"
+
+        echo "Authenticating with ECR..."
+
+
+        # Authenticate to AWS ECR
+
+        aws ecr get-login-password --region $region | docker login --username AWS --password-stdin $IMAGEREPO
+
+
+        # Build Container Image
+
+        docker build -t $fullImage:$BUILD_BUILDNUMBER $BUILD_ARTIFACTSTAGINGDIRECTORY
+
+
+        # Push Container Image
+
+        docker push $fullImage:$BUILD_BUILDNUMBER
+  - task: Bash@3
+    displayName: Construct Deployment Artifact
+    inputs:
+      targetType: inline
+      script: >-
+        # Constructs a json object with details about the built image
+
+
+        timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+
+
+        JsonString=$(jq -n \
+
+        --arg ts "$timestamp" \
+
+        --arg ir "$IMAGEREPO" \
+
+        --arg in "$IMAGENAME" \
+
+        --arg iv "$BUILD_BUILDNUMBER" \
+
+        --arg bah "$AGENT_NAME" \
+
+        --arg bav "$AGENT_VERSION" \
+
+        --arg bn "$BUILD_DEFINITIONNAME" \
+
+        --arg brep "$BUILD_REPOSITORY_NAME" \
+
+        --arg bb "$BUILD_SOURCEBRANCH" \
+
+        --arg bf "$BUILD_REQUESTEDFOR" \
+
+        --arg brea "$BUILD_REASON" \
+
+        --arg bnum "$BUILD_BUILDNUMBER" \
+
+        --arg blp "$BUILD_REPOSITORY_LOCALPATH" \
+
+        --arg bc "$BUILDCONFIGURATION" \
+
+        --arg bp "$BUILDPLATFORM" \
+
+        --arg bsv "$BUILD_SOURCEVERSION" \
+
+        --arg bsm "$BUILD_SOURCEVERSIONMESSAGE" \
+
+        '{Date:$ts,Image:{Repo:$ir,Name:$in,Version:$iv},Build:{Agent:{Host:$bah,Version:$bav},Name:$bn,Repository:$brep,Branch:$bb,For:$bf,Reason:$brea,Number:$bnum,LocalPath:$blp,Configuration:$bc,Platform:$bp,SourceVersion:$bsv,SourceMessage:$bsm}}'
+
+        )
+
+
+        echo "$JsonString" | jq '.'
+
+        ArtifactOutput="${BUILD_ARTIFACTSTAGINGDIRECTORY}/build-details.json"
+
+        echo "$JsonString" | jq '.' > $ArtifactOutput
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish Artifact: drop'
+    inputs:
+      PathtoPublish: $(Build.ArtifactStagingDirectory)/build-details.json
+...
